@@ -30,15 +30,9 @@ app.use(express.json());
 
 // formrun からの Webhook を受け取る場所
 app.post("/formrun-webhook", async (req, res) => {
-  // formrun から画像URLを取り出す（項目名に応じて調整）
-  const imageUrl = req.body.answers.file_upload.value;
+  console.log("=== 受信したJSON ===");
+  console.log(JSON.stringify(req.body, null, 2));
 
-  console.log("画像URL:", imageUrl);
-
-  // Vision API でOCR実行
-  const ocrText = await callVisionAPI(imageUrl);
-
-  console.log("OCR結果:", ocrText);
   res.status(200).send("OK");
 });
 
