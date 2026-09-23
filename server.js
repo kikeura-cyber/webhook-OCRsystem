@@ -3,6 +3,24 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
+const FORMRUN_API_KEY = process.env.FORMRUN_API_KEY;
+
+// formrun API で添付ファイルの本物URLを取得
+async function getRealAttachmentUrl(formId, entryId) {
+  const url = `https://api.form.run/v2/forms/${formId}/entries/${entryId}`;
+
+  const response = await fetch(url, {
+    headers: {
+      "X-Formrun-Api-Key": FORMRUN_API_KEY
+    }
+  });
+
+  const data = await response.json();
+
+  // 添付ファイルの本物URL（署名付きURL）
+  return data.entry.attachments[0].url;
+}
+
 // 画像をダウンロードして base64 に変換
 async function downloadImageAsBase64(url) {
   const response = await fetch(url);
@@ -10,7 +28,7 @@ async function downloadImageAsBase64(url) {
   return buffer.toString("base64");
 }
 
-// Vision API 呼び出し（base64方式）
+// Vision API 呼び出し
 async function callVisionAPI(base64Image) {
   const apiKey = process.env.VISION_API_KEY;
 
@@ -41,19 +59,15 @@ app.post("/formrun-webhook", async (req, res) => {
   console.log("=== 受信したJSON ===");
   console.log(JSON.stringify(req.body, null, 2));
 
-  // fields から画像URLを取得
-  const fileField = req.body.fields.find(f => f.label === "ファイルアップロード");
-  const imageUrl = fileField ? fileField.value : null;
+  const formId = req.body.form_id;
+  const entryId = req.body.entry_id;
 
-  console.log("画像URL:", imageUrl);
-
-  if (!imageUrl) {
-    console.log("画像URLが見つかりません");
-    return res.status(200).send("NO IMAGE");
-  }
+  // formrun API で本物の画像URLを取得
+  const realUrl = await getRealAttachmentUrl(formId, entryId);
+  console.log("本物の画像URL:", realUrl);
 
   // 画像をダウンロードして base64 に変換
-  const base64Image = await downloadImageAsBase64(imageUrl);
+  const base64Image = await downloadImageAsBase64(realUrl);
 
   // Vision API OCR
   const ocrText = await callVisionAPI(base64Image);
