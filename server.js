@@ -27,7 +27,12 @@ async function callVisionAPI(base64Image) {
 
   const data = await response.json();
 
-  // fullTextAnnotation が無い場合は "(テキストなし)" を返す
+  // responses が無い場合の安全処理
+  if (!data.responses || !data.responses[0]) {
+    console.log("Vision API が画像を認識できませんでした:", JSON.stringify(data, null, 2));
+    return "(テキストなし)";
+  }
+
   return data.responses[0].fullTextAnnotation?.text || "(テキストなし)";
 }
 
@@ -44,6 +49,12 @@ app.post("/formrun-webhook", async (req, res) => {
   try {
     // 画像をダウンロードして base64 に変換
     const response = await fetch(imageUrl);
+
+    if (!response.ok) {
+      console.log("画像のダウンロードに失敗:", response.status);
+      return res.status(200).send("IMAGE DOWNLOAD ERROR");
+    }
+
     const buffer = await response.buffer();
     const base64Image = buffer.toString("base64");
 
