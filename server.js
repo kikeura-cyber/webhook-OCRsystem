@@ -3,31 +3,6 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
-const FORMRUN_API_KEY = process.env.FORMRUN_API_KEY;
-
-// formrun API で添付ファイルの本物URLを取得
-async function getRealAttachmentUrl(formId, entryId) {
-  const url = `https://api.form.run/v2/forms/${formId}/entries/${entryId}`;
-
-  const response = await fetch(url, {
-    headers: {
-      "X-Formrun-Api-Key": FORMRUN_API_KEY
-    }
-  });
-
-  const data = await response.json();
-
-  // 添付ファイルの本物URL（署名付きURL）
-  return data.entry.attachments[0].url;
-}
-
-// 画像をダウンロードして base64 に変換
-async function downloadImageAsBase64(url) {
-  const response = await fetch(url);
-  const buffer = await response.buffer();
-  return buffer.toString("base64");
-}
-
 // Vision API 呼び出し
 async function callVisionAPI(base64Image) {
   const apiKey = process.env.VISION_API_KEY;
@@ -51,29 +26,36 @@ async function callVisionAPI(base64Image) {
   );
 
   const data = await response.json();
+
+  // fullTextAnnotation が無い場合は "(テキストなし)" を返す
   return data.responses[0].fullTextAnnotation?.text || "(テキストなし)";
 }
 
-// Webhook 受信
 app.post("/formrun-webhook", async (req, res) => {
   console.log("=== 受信したJSON ===");
   console.log(JSON.stringify(req.body, null, 2));
 
-  const formId = req.body.form_id;
-  const entryId = req.body.entry_id;
+  // form_attachment_urls は JSON文字列なので parse が必要
+  const attachments = JSON.parse(req.body.form_attachment_urls);
+  const imageUrl = attachments[0];
 
-  // formrun API で本物の画像URLを取得
-  const realUrl = await getRealAttachmentUrl(formId, entryId);
-  console.log("本物の画像URL:", realUrl);
+  console.log("画像URL:", imageUrl);
 
-  // 画像をダウンロードして base64 に変換
-  const base64Image = await downloadImageAsBase64(realUrl);
+  try {
+    // 画像をダウンロードして base64 に変換
+    const response = await fetch(imageUrl);
+    const buffer = await response.buffer();
+    const base64Image = buffer.toString("base64");
 
-  // Vision API OCR
-  const ocrText = await callVisionAPI(base64Image);
-  console.log("OCR結果:", ocrText);
+    // Vision API OCR
+    const ocrText = await callVisionAPI(base64Image);
+    console.log("OCR結果:", ocrText);
 
-  res.status(200).send("OK");
+    res.status(200).send("OK");
+  } catch (error) {
+    console.error("OCR処理中にエラー:", error);
+    res.status(500).send("ERROR");
+  }
 });
 
 app.listen(3000, () => console.log("server started"));
