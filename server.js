@@ -1,6 +1,11 @@
 const fetch = require("node-fetch");
+const express = require("express");
+const app = express();
+app.use(express.json());
+
+// Vision API 呼び出し関数
 async function callVisionAPI(imageUrl) {
-  const apiKey = process.env.VISION_API_KEY; // Render に設定する環境変数
+  const apiKey = process.env.VISION_API_KEY;
 
   const requestBody = {
     requests: [
@@ -24,17 +29,27 @@ async function callVisionAPI(imageUrl) {
   return data.responses[0].fullTextAnnotation.text;
 }
 
-const express = require("express");
-const app = express();
-app.use(express.json());
-
-// formrun からの Webhook を受け取る場所
+// Webhook 受信
 app.post("/formrun-webhook", async (req, res) => {
   console.log("=== 受信したJSON ===");
   console.log(JSON.stringify(req.body, null, 2));
 
+  // fields から「ファイルアップロード」を探す
+  const fileField = req.body.fields.find(f => f.label === "ファイルアップロード");
+  const imageUrl = fileField ? fileField.value : null;
+
+  console.log("画像URL:", imageUrl);
+
+  if (!imageUrl) {
+    console.log("画像URLが見つかりませんでした");
+    return res.status(200).send("NO IMAGE");
+  }
+
+  // Vision API OCR
+  const ocrText = await callVisionAPI(imageUrl);
+  console.log("OCR結果:", ocrText);
+
   res.status(200).send("OK");
 });
 
-// Render が使うポート番号
 app.listen(3000, () => console.log("server started"));
