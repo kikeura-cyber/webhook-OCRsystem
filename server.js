@@ -146,6 +146,33 @@ async function addMemoToFormrun(formId, entryId, memoText) {
   console.log("formrun カードへのメモ登録が完了しました。");
 }
 
+// Googleスプレッドシート（GAS Webアプリ）へ行を追加
+async function sendToSpreadsheet(data) {
+  const gasUrl = process.env.SPREADSHEET_WEBHOOK_URL;
+  if (!gasUrl) {
+    console.log("SPREADSHEET_WEBHOOK_URL が未設定のため、スプレッドシート出力をスキップします。");
+    return;
+  }
+
+  console.log("スプレッドシート書き込みリクエスト送信中...");
+  try {
+    const response = await fetch(gasUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("スプレッドシート書き込みエラー (ステータス: " + response.status + "):", errorText);
+    } else {
+      console.log("スプレッドシートへの書き込みが完了しました。");
+    }
+  } catch (err) {
+    console.error("スプレッドシート送信中に例外発生:", err.message || err);
+  }
+}
+
 app.post("/formrun-webhook", async (req, res) => {
   console.log("=== 受信したJSON ===");
   console.log(JSON.stringify(req.body, null, 2));
@@ -178,6 +205,20 @@ app.post("/formrun-webhook", async (req, res) => {
     // 4. formrun の該当カードに OCR 結果をメモとして自動登録
     await addMemoToFormrun(form_id, entry_id, ocrText);
 
+    // 5. Googleスプレッドシートへ自動出力
+    const emailField = (req.body.fields || []).find(
+      (f) => f.label === "メールアドレス" || f.key === "_field_1"
+    );
+
+    await sendToSpreadsheet({
+      entry_number: entry_number,
+      entry_time: req.body.entry_time,
+      form_name: req.body.form_name,
+      email: emailField ? emailField.value : "",
+      entry_card_url: req.body.entry_card_url,
+      ocr_text: ocrText
+    });
+
     res.status(200).send("OK");
   } catch (error) {
     console.error("処理中にエラーが発生:", error.message || error);
@@ -186,3 +227,4 @@ app.post("/formrun-webhook", async (req, res) => {
 });
 
 app.listen(3000, () => console.log("server started"));
+
