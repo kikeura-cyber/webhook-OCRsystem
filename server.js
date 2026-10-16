@@ -162,6 +162,101 @@ async function addMemoToFormrun(formId, entryId, memoText) {
   console.log("formrun カードへのメモ登録が完了しました。");
 }
 
+// OCRテキストから【氏名・日付・開始時間・終了時間・休憩時間】を抽出（フォールバック用）
+function fallbackExtractFields(text) {
+  const result = {
+    name: "",
+    date: "",
+    startTime: "",
+    endTime: "",
+    breakTime: ""
+  };
+
+  // 日付の抽出 (例: 2026/10/16, 2026年10月16日, 10月16日, 10/16)
+  const dateMatch = text.match(/(?:20\d{2}[年/.-])?\d{1,2}[月/.-]\d{1,2}日?/);
+  if (dateMatch) result.date = dateMatch[0].trim();
+
+  // 時間の抽出 (例: 09:00, 18:00)
+  const timeMatches = text.match(/\b\d{1,2}[:：]\d{2}\b/g) || [];
+  if (timeMatches.length >= 1) result.startTime = timeMatches[0].replace("：", ":");
+  if (timeMatches.length >= 2) result.endTime = timeMatches[1].replace("：", ":");
+  if (timeMatches.length >= 3) result.breakTime = timeMatches[2].replace("：", ":");
+
+  // 休憩時間のキーワード抽出 (例: 休憩: 1:00, 休憩 60分 など)
+  const breakMatch = text.match(/休憩[^\d\n]*(\d+(?:[:：]\d{2}|時間|\s*分)?)/);
+  if (breakMatch && !result.breakTime) {
+    result.breakTime = breakMatch[1];
+  }
+
+  // 氏名のキーワード抽出 (例: 氏名: 山田太郎, 名前: 山田太郎)
+  const nameMatch = text.match(/(?:氏名|名前|氏\s*名)[：:\s]*([^\r\n\t 　]{2,12})/);
+  if (nameMatch) {
+    result.name = nameMatch[1].trim();
+  }
+
+  return result;
+}
+
+// AI (Gemini API) を用いてOCRテキストから項目を構造化抽出
+async function extractFieldsWithAI(ocrText) {
+  const apiKey = process.env.GEMINI_API_KEY || process.env.VISION_API_KEY;
+  if (!apiKey) {
+    return fallbackExtractFields(ocrText);
+  }
+
+  try {
+    const prompt = `以下のOCRで読み取った勤務表・タイムカードのテキストから、【氏名】、【日付】、【開始時間】、【終了時間】、【休憩時間】を抽出してください。
+必ず以下のJSONフォーマットのみを返してください。Markdownや余計な解説は一切含めないでください。
+
+{
+  "name": "抽出した氏名（不明な場合は空文字）",
+  "date": "抽出した日付（YYYY/MM/DD形式推奨、不明な場合は空文字）",
+  "startTime": "抽出した開始時間（HH:MM形式、不明な場合は空文字）",
+  "endTime": "抽出した終了時間（HH:MM形式、不明な場合は空文字）",
+  "breakTime": "抽出した休憩時間（例: 1:00 または 60分、不明な場合は空文字）"
+}
+
+--- OCRテキスト ---
+${ocrText}`;
+
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseMimeType: "application/json"
+          }
+        })
+      }
+    );
+
+    if (!res.ok) {
+      console.log("Gemini API利用不可 (ステータス: " + res.status + ")。ルールベース抽出に切り替えます。");
+      return fallbackExtractFields(ocrText);
+    }
+
+    const data = await res.json();
+    const rawJson = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (rawJson) {
+      const parsed = JSON.parse(rawJson);
+      return {
+        name: parsed.name || "",
+        date: parsed.date || "",
+        startTime: parsed.startTime || "",
+        endTime: parsed.endTime || "",
+        breakTime: parsed.breakTime || ""
+      };
+    }
+  } catch (err) {
+    console.warn("AI項目抽出でエラー、フォールバックを使用:", err.message);
+  }
+
+  return fallbackExtractFields(ocrText);
+}
+
 // Googleスプレッドシート（GAS Webアプリ）へ行を追加
 async function sendToSpreadsheet(data) {
   const gasUrl = process.env.SPREADSHEET_WEBHOOK_URL;
@@ -199,8 +294,15 @@ app.post("/formrun-webhook", async (req, res) => {
     // 1. formrun API からすべての添付ファイル情報を取得
     const attachments = await getAttachmentsFromFormrun(form_id, entry_id, entry_number);
 
-    // 2. すべての画像を順次ダウンロードして OCR 実行
+    const emailField = (req.body.fields || []).find(
+      (f) => f.label === "メールアドレス" || f.key === "_field_1"
+    );
+    const email = emailField ? emailField.value : "";
+
+    // 2. すべての画像を順次ダウンロード ＞ OCR ＞ 項目抽出
     const ocrResults = [];
+    const spreadsheetRows = [];
+
     for (let i = 0; i < attachments.length; i++) {
       const file = attachments[i];
       console.log(`[${i + 1}/${attachments.length}] 画像ダウンロード中: ${file.filename}`);
@@ -208,11 +310,6 @@ app.post("/formrun-webhook", async (req, res) => {
       const imgResponse = await fetch(file.url);
       if (!imgResponse.ok) {
         console.warn(`[${i + 1}/${attachments.length}] ダウンロード失敗 (ステータス: ${imgResponse.status})`);
-        ocrResults.push({
-          index: i + 1,
-          filename: file.filename,
-          text: `(ダウンロード失敗: HTTP ${imgResponse.status})`
-        });
         continue;
       }
 
@@ -220,43 +317,57 @@ app.post("/formrun-webhook", async (req, res) => {
       const base64Image = buffer.toString("base64");
 
       console.log(`[${i + 1}/${attachments.length}] Vision API OCR 実行中: ${file.filename}`);
-      const text = await callVisionAPI(base64Image);
+      const rawText = await callVisionAPI(base64Image);
+
+      console.log(`[${i + 1}/${attachments.length}] 項目抽出実行中 (氏名・日付・時間)...`);
+      const extracted = await extractFieldsWithAI(rawText);
+      console.log(`抽出結果:`, JSON.stringify(extracted));
+
       ocrResults.push({
         index: i + 1,
         filename: file.filename,
-        text: text
+        extracted: extracted,
+        text: rawText
+      });
+
+      // スプレッドシート用の1行データ（画像1枚につき1行）
+      spreadsheetRows.push({
+        entry_number: entry_number,
+        entry_time: req.body.entry_time,
+        filename: file.filename,
+        name: extracted.name,
+        date: extracted.date,
+        start_time: extracted.startTime,
+        end_time: extracted.endTime,
+        break_time: extracted.breakTime,
+        email: email,
+        entry_card_url: req.body.entry_card_url,
+        ocr_text: rawText
       });
     }
 
-    // 3. OCR結果を結合
-    let combinedOcrText = "";
-    if (ocrResults.length === 1) {
-      combinedOcrText = `[ファイル名: ${ocrResults[0].filename}]\n${ocrResults[0].text}`;
-    } else {
-      combinedOcrText = ocrResults
-        .map((r) => `--- [${r.index}/${ocrResults.length}] ${r.filename} ---\n${r.text}`)
-        .join("\n\n");
-    }
+    // 3. formrun メモ用テキストの作成
+    const memoBlocks = ocrResults.map((r) => {
+      return [
+        `--- [${r.index}/${ocrResults.length}] ${r.filename} ---`,
+        `【氏名】: ${r.extracted.name || "(未検出)"}`,
+        `【日付】: ${r.extracted.date || "(未検出)"}`,
+        `【開始時間】: ${r.extracted.startTime || "(未検出)"}`,
+        `【終了時間】: ${r.extracted.endTime || "(未検出)"}`,
+        `【休憩時間】: ${r.extracted.breakTime || "(未検出)"}`,
+        `\n[全文テキスト]\n${r.text}`
+      ].join("\n");
+    });
+    const combinedMemoText = memoBlocks.join("\n\n===============\n\n");
 
-    console.log("=== OCR結果（全体） ===");
-    console.log(combinedOcrText);
+    console.log("=== メモ内容 ===");
+    console.log(combinedMemoText);
 
     // 4. formrun の該当カードに OCR 結果をメモとして自動登録
-    await addMemoToFormrun(form_id, entry_id, combinedOcrText);
+    await addMemoToFormrun(form_id, entry_id, combinedMemoText);
 
-    // 5. Googleスプレッドシートへ自動出力
-    const emailField = (req.body.fields || []).find(
-      (f) => f.label === "メールアドレス" || f.key === "_field_1"
-    );
-
-    await sendToSpreadsheet({
-      entry_number: entry_number,
-      entry_time: req.body.entry_time,
-      form_name: req.body.form_name,
-      email: emailField ? emailField.value : "",
-      entry_card_url: req.body.entry_card_url,
-      ocr_text: combinedOcrText
-    });
+    // 5. Googleスプレッドシートへ自動出力（画像1枚につき1行）
+    await sendToSpreadsheet({ rows: spreadsheetRows });
 
     res.status(200).send("OK");
   } catch (error) {
