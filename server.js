@@ -46,10 +46,23 @@ async function callVisionAPI(base64Image) {
 
 // formrun API を呼び出して添付ファイルのダウンロード用URL（有効期限1時間）を取得
 async function getAttachmentUrlFromFormrun(formId, entryId, entryNumber) {
-  const formrunApiKey = process.env.FORMRUN_API_KEY;
+  let formrunApiKey = process.env.FORMRUN_API_KEY;
   if (!formrunApiKey) {
     throw new Error("環境変数 FORMRUN_API_KEY が設定されていません。Render等の環境変数に設定してください。");
   }
+
+  // 前後の余計な空白・改行を除去し、もし "Bearer " が含まれていれば除去
+  formrunApiKey = formrunApiKey.trim().replace(/^Bearer\s+/i, "");
+
+  console.log(
+    "formrun APIキー確認 (長さ: " +
+      formrunApiKey.length +
+      ", 先頭末尾: " +
+      formrunApiKey.slice(0, 4) +
+      "..." +
+      formrunApiKey.slice(-4) +
+      ")"
+  );
 
   const queryParams = new URLSearchParams();
   if (entryNumber) {
@@ -97,6 +110,42 @@ async function getAttachmentUrlFromFormrun(formId, entryId, entryNumber) {
   throw new Error("カード内に添付ファイル (files) が見つかりませんでした。");
 }
 
+// formrun のカードに OCR 結果をメモとして追加
+async function addMemoToFormrun(formId, entryId, memoText) {
+  let formrunApiKey = process.env.FORMRUN_API_KEY;
+  if (!formrunApiKey) {
+    console.warn("FORMRUN_API_KEY が未設定のためメモ登録をスキップします。");
+    return;
+  }
+  formrunApiKey = formrunApiKey.trim().replace(/^Bearer\s+/i, "");
+
+  const url = `https://form.run/api/public/v1/forms/${formId}/entries/${entryId}/memos`;
+  console.log("formrun メモ登録 API 呼び出し URL:", url);
+
+  // メモ本文の作成（APIの10,000文字制限に対応）
+  let content = `【AI-OCR 読み取り結果】\n${memoText || "(テキストが検出されませんでした)"}`;
+  if (content.length > 9900) {
+    content = content.slice(0, 9900) + "\n...(文字数制限のため以降省略)";
+  }
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${formrunApiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ body: content })
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`formrun メモ登録エラー (ステータス: ${response.status}):`, errorBody);
+    throw new Error(`formrun メモ登録に失敗しました: ${errorBody}`);
+  }
+
+  console.log("formrun カードへのメモ登録が完了しました。");
+}
+
 app.post("/formrun-webhook", async (req, res) => {
   console.log("=== 受信したJSON ===");
   console.log(JSON.stringify(req.body, null, 2));
@@ -126,6 +175,9 @@ app.post("/formrun-webhook", async (req, res) => {
     console.log("=== OCR結果 ===");
     console.log(ocrText);
 
+    // 4. formrun の該当カードに OCR 結果をメモとして自動登録
+    await addMemoToFormrun(form_id, entry_id, ocrText);
+
     res.status(200).send("OK");
   } catch (error) {
     console.error("処理中にエラーが発生:", error.message || error);
@@ -134,4 +186,3 @@ app.post("/formrun-webhook", async (req, res) => {
 });
 
 app.listen(3000, () => console.log("server started"));
-
