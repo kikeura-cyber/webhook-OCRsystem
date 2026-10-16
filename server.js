@@ -6,6 +6,9 @@ app.use(express.json());
 // Vision API 呼び出し
 async function callVisionAPI(base64Image) {
   const apiKey = process.env.VISION_API_KEY;
+  if (!apiKey) {
+    throw new Error("環境変数 VISION_API_KEY が設定されていません。");
+  }
 
   const requestBody = {
     requests: [
@@ -27,6 +30,11 @@ async function callVisionAPI(base64Image) {
 
   const data = await response.json();
 
+  if (data.error) {
+    console.error("Vision API エラーレスポンス:", JSON.stringify(data.error, null, 2));
+    throw new Error(`Vision API Error: ${data.error.message}`);
+  }
+
   // responses が無い場合の安全処理
   if (!data.responses || !data.responses[0]) {
     console.log("Vision API が画像を認識できませんでした:", JSON.stringify(data, null, 2));
@@ -36,37 +44,94 @@ async function callVisionAPI(base64Image) {
   return data.responses[0].fullTextAnnotation?.text || "(テキストなし)";
 }
 
+// formrun API を呼び出して添付ファイルのダウンロード用URL（有効期限1時間）を取得
+async function getAttachmentUrlFromFormrun(formId, entryId, entryNumber) {
+  const formrunApiKey = process.env.FORMRUN_API_KEY;
+  if (!formrunApiKey) {
+    throw new Error("環境変数 FORMRUN_API_KEY が設定されていません。Render等の環境変数に設定してください。");
+  }
+
+  const queryParams = new URLSearchParams();
+  if (entryNumber) {
+    queryParams.append("number_from", entryNumber);
+    queryParams.append("number_to", entryNumber);
+  }
+
+  const url = `https://form.run/api/public/v1/forms/${formId}/entries?${queryParams.toString()}`;
+  console.log("formrun API 呼び出し URL:", url);
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "Authorization": `Bearer ${formrunApiKey}`,
+      "Content-Type": "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`formrun API エラー (ステータス: ${response.status}): ${errorBody}`);
+  }
+
+  const result = await response.json();
+  const entries = result.data || [];
+
+  // entryId または entryNumber で一致するカードを探す
+  const targetEntry = entries.find(
+    e => String(e.id) === String(entryId) || String(e.number) === String(entryNumber)
+  ) || entries[0];
+
+  if (!targetEntry) {
+    throw new Error(`カードが見つかりませんでした (entry_id: ${entryId}, entry_number: ${entryNumber})`);
+  }
+
+  // 回答項目 (fields) の中からファイル添付項目を探す
+  for (const field of targetEntry.fields || []) {
+    if (field.files && field.files.length > 0) {
+      const fileInfo = field.files[0];
+      console.log(`添付ファイル取得成功: ${fileInfo.filename} (${fileInfo.content_type})`);
+      return fileInfo.url;
+    }
+  }
+
+  throw new Error("カード内に添付ファイル (files) が見つかりませんでした。");
+}
+
 app.post("/formrun-webhook", async (req, res) => {
   console.log("=== 受信したJSON ===");
   console.log(JSON.stringify(req.body, null, 2));
 
-  // form_attachment_urls は JSON文字列なので parse が必要
-  const attachments = JSON.parse(req.body.form_attachment_urls);
-  const imageUrl = attachments[0];
-
-  console.log("画像URL:", imageUrl);
+  const { form_id, entry_id, entry_number } = req.body;
 
   try {
-    // 画像をダウンロードして base64 に変換
-    const response = await fetch(imageUrl);
+    // 1. formrun API から認証不要・有効期限付きのダウンロードURLを取得
+    const downloadUrl = await getAttachmentUrlFromFormrun(form_id, entry_id, entry_number);
+    console.log("ダウンロード用URL取得完了:", downloadUrl);
 
-    if (!response.ok) {
-      console.log("画像のダウンロードに失敗:", response.status);
+    // 2. 実画像データをダウンロード
+    const imgResponse = await fetch(downloadUrl);
+    if (!imgResponse.ok) {
+      console.log("画像のダウンロードに失敗:", imgResponse.status);
       return res.status(200).send("IMAGE DOWNLOAD ERROR");
     }
 
-    const buffer = await response.buffer();
+    const contentType = imgResponse.headers.get("content-type");
+    console.log("ダウンロードしたContent-Type:", contentType);
+
+    const buffer = await imgResponse.buffer();
     const base64Image = buffer.toString("base64");
 
-    // Vision API OCR
+    // 3. Vision API で OCR 実行
     const ocrText = await callVisionAPI(base64Image);
-    console.log("OCR結果:", ocrText);
+    console.log("=== OCR結果 ===");
+    console.log(ocrText);
 
     res.status(200).send("OK");
   } catch (error) {
-    console.error("OCR処理中にエラー:", error);
+    console.error("処理中にエラーが発生:", error.message || error);
     res.status(500).send("ERROR");
   }
 });
 
 app.listen(3000, () => console.log("server started"));
+
