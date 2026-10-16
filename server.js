@@ -44,8 +44,8 @@ async function callVisionAPI(base64Image) {
   return data.responses[0].fullTextAnnotation?.text || "(テキストなし)";
 }
 
-// formrun API を呼び出して添付ファイルのダウンロード用URL（有効期限1時間）を取得
-async function getAttachmentUrlFromFormrun(formId, entryId, entryNumber) {
+// formrun API を呼び出してすべての添付ファイル情報（ダウンロード用URL付き）を取得
+async function getAttachmentsFromFormrun(formId, entryId, entryNumber) {
   let formrunApiKey = process.env.FORMRUN_API_KEY;
   if (!formrunApiKey) {
     throw new Error("環境変数 FORMRUN_API_KEY が設定されていません。Render等の環境変数に設定してください。");
@@ -91,23 +91,39 @@ async function getAttachmentUrlFromFormrun(formId, entryId, entryNumber) {
 
   // entryId または entryNumber で一致するカードを探す
   const targetEntry = entries.find(
-    e => String(e.id) === String(entryId) || String(e.number) === String(entryNumber)
+    (e) => String(e.id) === String(entryId) || String(e.number) === String(entryNumber)
   ) || entries[0];
 
   if (!targetEntry) {
     throw new Error(`カードが見つかりませんでした (entry_id: ${entryId}, entry_number: ${entryNumber})`);
   }
 
-  // 回答項目 (fields) の中からファイル添付項目を探す
+  // 回答項目 (fields) の中からすべてのファイル添付項目を収集
+  const attachments = [];
   for (const field of targetEntry.fields || []) {
-    if (field.files && field.files.length > 0) {
-      const fileInfo = field.files[0];
-      console.log(`添付ファイル取得成功: ${fileInfo.filename} (${fileInfo.content_type})`);
-      return fileInfo.url;
+    if (field.files && Array.isArray(field.files)) {
+      for (const file of field.files) {
+        if (file.url) {
+          attachments.push({
+            filename: file.filename || "image",
+            contentType: file.content_type || "",
+            size: file.size,
+            url: file.url
+          });
+        }
+      }
     }
   }
 
-  throw new Error("カード内に添付ファイル (files) が見つかりませんでした。");
+  if (attachments.length === 0) {
+    throw new Error("カード内に添付ファイル (files) が見つかりませんでした。");
+  }
+
+  console.log(
+    `添付ファイルを計 ${attachments.length} 件取得しました:`,
+    attachments.map((a) => a.filename).join(", ")
+  );
+  return attachments;
 }
 
 // formrun のカードに OCR 結果をメモとして追加
@@ -180,30 +196,53 @@ app.post("/formrun-webhook", async (req, res) => {
   const { form_id, entry_id, entry_number } = req.body;
 
   try {
-    // 1. formrun API から認証不要・有効期限付きのダウンロードURLを取得
-    const downloadUrl = await getAttachmentUrlFromFormrun(form_id, entry_id, entry_number);
-    console.log("ダウンロード用URL取得完了:", downloadUrl);
+    // 1. formrun API からすべての添付ファイル情報を取得
+    const attachments = await getAttachmentsFromFormrun(form_id, entry_id, entry_number);
 
-    // 2. 実画像データをダウンロード
-    const imgResponse = await fetch(downloadUrl);
-    if (!imgResponse.ok) {
-      console.log("画像のダウンロードに失敗:", imgResponse.status);
-      return res.status(200).send("IMAGE DOWNLOAD ERROR");
+    // 2. すべての画像を順次ダウンロードして OCR 実行
+    const ocrResults = [];
+    for (let i = 0; i < attachments.length; i++) {
+      const file = attachments[i];
+      console.log(`[${i + 1}/${attachments.length}] 画像ダウンロード中: ${file.filename}`);
+
+      const imgResponse = await fetch(file.url);
+      if (!imgResponse.ok) {
+        console.warn(`[${i + 1}/${attachments.length}] ダウンロード失敗 (ステータス: ${imgResponse.status})`);
+        ocrResults.push({
+          index: i + 1,
+          filename: file.filename,
+          text: `(ダウンロード失敗: HTTP ${imgResponse.status})`
+        });
+        continue;
+      }
+
+      const buffer = await imgResponse.buffer();
+      const base64Image = buffer.toString("base64");
+
+      console.log(`[${i + 1}/${attachments.length}] Vision API OCR 実行中: ${file.filename}`);
+      const text = await callVisionAPI(base64Image);
+      ocrResults.push({
+        index: i + 1,
+        filename: file.filename,
+        text: text
+      });
     }
 
-    const contentType = imgResponse.headers.get("content-type");
-    console.log("ダウンロードしたContent-Type:", contentType);
+    // 3. OCR結果を結合
+    let combinedOcrText = "";
+    if (ocrResults.length === 1) {
+      combinedOcrText = `[ファイル名: ${ocrResults[0].filename}]\n${ocrResults[0].text}`;
+    } else {
+      combinedOcrText = ocrResults
+        .map((r) => `--- [${r.index}/${ocrResults.length}] ${r.filename} ---\n${r.text}`)
+        .join("\n\n");
+    }
 
-    const buffer = await imgResponse.buffer();
-    const base64Image = buffer.toString("base64");
-
-    // 3. Vision API で OCR 実行
-    const ocrText = await callVisionAPI(base64Image);
-    console.log("=== OCR結果 ===");
-    console.log(ocrText);
+    console.log("=== OCR結果（全体） ===");
+    console.log(combinedOcrText);
 
     // 4. formrun の該当カードに OCR 結果をメモとして自動登録
-    await addMemoToFormrun(form_id, entry_id, ocrText);
+    await addMemoToFormrun(form_id, entry_id, combinedOcrText);
 
     // 5. Googleスプレッドシートへ自動出力
     const emailField = (req.body.fields || []).find(
@@ -216,7 +255,7 @@ app.post("/formrun-webhook", async (req, res) => {
       form_name: req.body.form_name,
       email: emailField ? emailField.value : "",
       entry_card_url: req.body.entry_card_url,
-      ocr_text: ocrText
+      ocr_text: combinedOcrText
     });
 
     res.status(200).send("OK");
@@ -226,5 +265,6 @@ app.post("/formrun-webhook", async (req, res) => {
   }
 });
 
+app.listen(3000, () => console.log("server started"));
 app.listen(3000, () => console.log("server started"));
 
