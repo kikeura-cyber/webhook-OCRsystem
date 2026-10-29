@@ -3,7 +3,7 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
-// Vision API 呼び出し
+// Vision API 呼び出し（手書き特化モード）
 async function callVisionAPI(base64Image) {
   const apiKey = process.env.VISION_API_KEY;
   if (!apiKey) {
@@ -14,7 +14,10 @@ async function callVisionAPI(base64Image) {
     requests: [
       {
         image: { content: base64Image },
-        features: [{ type: "TEXT_DETECTION" }]
+        features: [{ type: "DOCUMENT_TEXT_DETECTION" }],
+        imageContext: {
+          languageHints: ["ja", "en"]
+        }
       }
     ]
   };
@@ -422,157 +425,3 @@ ${ocrText}`;
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseMimeType: "application/json"
-          }
-        })
-      }
-    );
-
-    if (!res.ok) {
-      console.log("Gemini API利用不可 (ステータス: " + res.status + ")。ルールベース抽出に切り替えます。");
-      return fallbackExtractFields(ocrText);
-    }
-
-    const data = await res.json();
-    const rawJson = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (rawJson) {
-      const parsed = JSON.parse(rawJson);
-      return normalizeFields(parsed, upperRawText);
-    }
-  } catch (err) {
-    console.warn("AI項目抽出でエラー、フォールバックを使用:", err.message);
-  }
-
-  return fallbackExtractFields(ocrText);
-}
-
-// Googleスプレッドシート（GAS Webアプリ）へ行を追加
-async function sendToSpreadsheet(data) {
-  const gasUrl = process.env.SPREADSHEET_WEBHOOK_URL;
-  if (!gasUrl) {
-    console.log("SPREADSHEET_WEBHOOK_URL が未設定のため、スプレッドシート出力をスキップします。");
-    return;
-  }
-
-  console.log("スプレッドシート書き込みリクエスト送信中...");
-  try {
-    const response = await fetch(gasUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data)
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("スプレッドシート書き込みエラー (ステータス: " + response.status + "):", errorText);
-    } else {
-      console.log("スプレッドシートへの書き込みが完了しました。");
-    }
-  } catch (err) {
-    console.error("スプレッドシート送信中に例外発生:", err.message || err);
-  }
-}
-
-app.post("/formrun-webhook", async (req, res) => {
-  console.log("=== 受信したJSON ===");
-  console.log(JSON.stringify(req.body, null, 2));
-
-  const { form_id, entry_id, entry_number } = req.body;
-
-  try {
-    // 1. formrun API からすべての添付ファイル情報を取得
-    const attachments = await getAttachmentsFromFormrun(form_id, entry_id, entry_number);
-
-    const emailField = (req.body.fields || []).find(
-      (f) => f.label === "メールアドレス" || f.key === "_field_1"
-    );
-    const email = emailField ? emailField.value : "";
-
-    // 2. すべての画像を順次ダウンロード ＞ OCR ＞ 項目抽出
-    const ocrResults = [];
-    const spreadsheetRows = [];
-
-    for (let i = 0; i < attachments.length; i++) {
-      const file = attachments[i];
-      console.log(`[${i + 1}/${attachments.length}] 画像ダウンロード中: ${file.filename}`);
-
-      const imgResponse = await fetch(file.url);
-      if (!imgResponse.ok) {
-        console.warn(`[${i + 1}/${attachments.length}] ダウンロード失敗 (ステータス: ${imgResponse.status})`);
-        continue;
-      }
-
-      const buffer = await imgResponse.buffer();
-      const base64Image = buffer.toString("base64");
-
-      console.log(`[${i + 1}/${attachments.length}] Vision API OCR 実行中: ${file.filename}`);
-      const rawText = await callVisionAPI(base64Image);
-
-      // ★最重要：下部の「備考」「交通費」「就業先」「確認印」以降を完全にカットし、上部枠内だけのテキストを作成
-      const upperSectionText = rawText.split(/備考|就業先|交通費|確認印/)[0].trim();
-
-      console.log(`[${i + 1}/${attachments.length}] 伝票フォーマット専用AI抽出中 (上部枠内)...`);
-      let extracted = await extractFieldsDirectlyFromImage(base64Image, file.contentType, upperSectionText);
-      if (!extracted) {
-        console.log(`[${i + 1}/${attachments.length}] テキストOCRからの項目抽出へフォールバックします...`);
-        extracted = await extractFieldsWithAI(upperSectionText, upperSectionText);
-      }
-      console.log(`抽出結果:`, JSON.stringify(extracted));
-
-      ocrResults.push({
-        index: i + 1,
-        filename: file.filename,
-        extracted: extracted,
-        text: upperSectionText // スプレッドシートやメモには上部枠内だけのテキストを保存
-      });
-
-      // スプレッドシート用の1行データ（画像1枚につき1行）
-      spreadsheetRows.push({
-        entry_number: entry_number,
-        entry_time: req.body.entry_time,
-        filename: file.filename,
-        name: extracted.name,
-        date: extracted.date,
-        start_time: extracted.startTime,
-        end_time: extracted.endTime,
-        break_time: extracted.breakTime,
-        email: email,
-        entry_card_url: req.body.entry_card_url,
-        ocr_text: upperSectionText // ★下部の不要な情報を除外したテキストのみを出力
-      });
-    }
-
-    // 3. formrun メモ用テキストの作成（上部枠内のみ）
-    const memoBlocks = ocrResults.map((r) => {
-      return [
-        `--- [${r.index}/${ocrResults.length}] ${r.filename} ---`,
-        `【氏名】: ${r.extracted.name || "(未検出)"}`,
-        `【日付】: ${r.extracted.date || "(未検出)"}`,
-        `【開始時間】: ${r.extracted.startTime || "(未検出)"}`,
-        `【終了時間】: ${r.extracted.endTime || "(未検出)"}`,
-        `【休憩時間】: ${r.extracted.breakTime || "(未検出)"}`,
-        `\n[読み取りテキスト（上部枠内のみ）]\n${r.text}`
-      ].join("\n");
-    });
-    const combinedMemoText = memoBlocks.join("\n\n===============\n\n");
-
-    console.log("=== メモ内容 ===");
-    console.log(combinedMemoText);
-
-    // 4. formrun の該当カードに OCR 結果をメモとして自動登録
-    await addMemoToFormrun(form_id, entry_id, combinedMemoText);
-
-    // 5. Googleスプレッドシートへ自動出力（画像1枚につき1行）
-    await sendToSpreadsheet({ rows: spreadsheetRows });
-
-    res.status(200).send("OK");
-  } catch (error) {
-    console.error("処理中にエラーが発生:", error.message || error);
-    res.status(500).send("ERROR");
-  }
-});
-
-app.listen(3000, () => console.log("server started"));
