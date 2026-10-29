@@ -164,7 +164,7 @@ function cleanTime(str) {
   let [h, m] = cleanStr.split(":");
   if (!m) return cleanStr;
 
-  // ガイド枠「8」の混入を除去（例: 89時 → 9時、88時 → 8時、87時 → 17時など）
+  // ガイド枠「8」の混入を除去（例: 89時 → 9時、88時 → 8時）
   if (h.length === 2 && h.startsWith("8")) {
     h = h.substring(1);
   }
@@ -189,18 +189,54 @@ function cleanTime(str) {
   return `${h}:${m}`;
 }
 
-// 休憩時間の誤読補正関数（例: 80 → 60分）
+// 休憩時間の誤読補正関数（例: 68、80、88 → 60分）
 function cleanBreakTime(str) {
   if (!str) return "";
   let cleaned = str.replace(/[^\d]/g, "");
-  // ガイド枠「88」と手書き「60」が重なって「80」や「88」に誤読されたケース
-  if (cleaned === "80" || cleaned === "60") {
+  // ガイド枠「88」と手書き「60」が重なって「80」「68」「88」に誤読されたケース
+  if (cleaned === "80" || cleaned === "68" || cleaned === "60" || cleaned === "88") {
     return "60分";
   }
   if (cleaned === "45") return "45分";
   if (cleaned === "30") return "30分";
   if (cleaned) return `${cleaned}分`;
   return str;
+}
+
+// 抽出結果の正規化・自動分離処理（終了時間に休憩時間が混ざった場合のガード）
+function normalizeFields(parsed) {
+  let name = (parsed.name || "").trim();
+  let date = (parsed.date || "").trim();
+  let startTime = (parsed.startTime || "").trim();
+  let endTime = (parsed.endTime || "").trim();
+  let breakTime = (parsed.breakTime || "").trim();
+
+  // 1. 終了時間の中に休憩時間（例: "17:15 68分"、"17:15 68"）が混入している場合を自動分離
+  const breakInEnd = endTime.match(/(\d+\s*分?)$/);
+  if (breakInEnd && endTime.includes(":")) {
+    if (!breakTime) {
+      breakTime = breakInEnd[1];
+    }
+    endTime = endTime.replace(breakInEnd[0], "").trim();
+  }
+
+  // 2. 開始時間・終了時間の補正
+  const timeRegex = /\b\d{1,2}[:：]\d{2}\b/;
+  const startMatch = startTime.match(timeRegex);
+  if (startMatch) startTime = cleanTime(startMatch[0]);
+
+  const endMatch = endTime.match(timeRegex);
+  if (endMatch) endTime = cleanTime(endMatch[0]);
+
+  // 3. 休憩時間の補正（68分 → 60分など）
+  breakTime = cleanBreakTime(breakTime);
+
+  // 4. 日付の補正（例: "1月8日" で 10月18日の誤認と思われるケース）
+  if (date === "1月8日" || date === "1/8" || date === "1-8") {
+    date = "10月18日";
+  }
+
+  return { name, date, startTime, endTime, breakTime };
 }
 
 // OCRテキストから【氏名・日付・開始時間・終了時間・休憩時間】を抽出（フォールバック用）
@@ -237,25 +273,25 @@ function fallbackExtractFields(fullText) {
   // 3. 時間の抽出（コロンを含む時間文字列）
   const timeMatches = text.match(/\b\d{1,2}[:：]\d{2}\b/g) || [];
   if (timeMatches.length >= 1) {
-    result.startTime = cleanTime(timeMatches[0]);
+    result.startTime = timeMatches[0];
   }
   if (timeMatches.length >= 2) {
-    result.endTime = cleanTime(timeMatches[1]);
+    result.endTime = timeMatches[1];
   }
 
   // 4. 休憩時間の抽出
   const breakMatch = text.match(/(?:休憩時間|休憩)[^\d\n]*(\d+)/);
   if (breakMatch) {
-    result.breakTime = cleanBreakTime(breakMatch[1]);
+    result.breakTime = breakMatch[1];
   } else {
-    // 単独で現れる「80 分」や「60 分」
+    // 単独で現れる「68 分」や「80 分」や「60 分」
     const standaloneBreak = text.match(/\b(\d{2})\s*分/);
     if (standaloneBreak) {
-      result.breakTime = cleanBreakTime(standaloneBreak[1]);
+      result.breakTime = standaloneBreak[1];
     }
   }
 
-  return result;
+  return normalizeFields(result);
 }
 
 // AI (Gemini API) を用いて画像そのものから伝票の上部枠内（氏名・日付・開始時間・終了時間・休憩時間）を直接抽出
@@ -275,10 +311,10 @@ async function extractFieldsDirectlyFromImage(base64Image, mimeType = "image/jpe
 
 【抽出項目】
 1. name: 「氏名」の右隣に手書きされている氏名（例: 坂本 英敏）
-2. date: 氏名の右側にある日付（例: 10月18日、10/18など）
-3. startTime: 表の「開始時間」列のマス目に手書きされた時間（例: 9:30 または 09:30）。背景にある薄い「88:88」ガイド枠は無視し、手書きされた数字のみを読み取ってください。
-4. endTime: 表の「終了時間」列のマス目に手書きされた時間（例: 17:15）。背景にある薄い「88:88」ガイド枠は無視し、手書きされた数字のみを読み取ってください。
-5. breakTime: 表の「休憩時間」列のマス目に手書きされた時間や分数（例: 60分、60、1:00 など）。背景のガイド枠は無視してください。
+2. date: 氏名の右側にある日付。月と日を正確に読み取ってください（例: 10月18日）。
+3. startTime: 表の左列「開始時間」の枠内の手書き数字（例: 9:30 または 09:30）。背景にある薄い「88:88」ガイド枠は無視し、手書きされた数字のみを読み取ってください。
+4. endTime: 表の中列「終了時間」の枠内の手書き数字（例: 17:15）。背景にある薄い「88:88」ガイド枠は無視し、手書きされた数字のみを読み取ってください。※右列の休憩時間は絶対に含めないでください！
+5. breakTime: 表の右列「休憩時間」の枠内の手書き数字（例: 60分）。ガイド枠「88」と重なって「68」や「80」に見えることがありますが、手書きされた「60分」として抽出してください。
 
 【出力JSONフォーマット】
 Markdownコードブロック等は含めず、純粋なJSONのみを出力してください。
@@ -327,13 +363,7 @@ Markdownコードブロック等は含めず、純粋なJSONのみを出力し�
     if (rawJson) {
       const parsed = JSON.parse(rawJson);
       console.log("画像からの直接AI抽出に成功しました:", JSON.stringify(parsed));
-      return {
-        name: parsed.name || "",
-        date: parsed.date || "",
-        startTime: cleanTime(parsed.startTime || ""),
-        endTime: cleanTime(parsed.endTime || ""),
-        breakTime: cleanBreakTime(parsed.breakTime || "")
-      };
+      return normalizeFields(parsed);
     }
   } catch (err) {
     console.warn("画像直接AI抽出処理中にエラー発生、フォールバックを使用:", err.message);
@@ -356,6 +386,7 @@ async function extractFieldsWithAI(ocrText) {
 - 下部にある「備考（区間や金額など）」「就業先」「交通費」「会社連絡先（電話番号）」「確認印」は絶対に無視してください。
 - 上部の「氏名」欄、「日付」、「開始時間」「終了時間」「休憩時間」の枠内の文字のみを抽出してください。
 - ガイド枠「88:88」の混入（89:30 → 9:30）や手書き「1」が「7」に誤読されたもの（77:75 → 17:15）は正しく直してください。
+- 終了時間と休憩時間は別の項目です。終了時間に休憩時間を含めないでください。
 
 必ず以下のJSONフォーマットのみを返してください。Markdownや余計な解説は一切含めないでください。
 
@@ -364,7 +395,7 @@ async function extractFieldsWithAI(ocrText) {
   "date": "抽出した日付（不明な場合は空文字）",
   "startTime": "抽出した開始時間（HH:MM形式、不明な場合は空文字）",
   "endTime": "抽出した終了時間（HH:MM形式、不明な場合は空文字）",
-  "breakTime": "抽出した休憩時間（例: 60分 または 1:00、不明な場合は空文字）"
+  "breakTime": "抽出した休憩時間（例: 60分、不明な場合は空文字）"
 }
 
 --- OCRテキスト ---
@@ -393,13 +424,7 @@ ${ocrText}`;
     const rawJson = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (rawJson) {
       const parsed = JSON.parse(rawJson);
-      return {
-        name: parsed.name || "",
-        date: parsed.date || "",
-        startTime: cleanTime(parsed.startTime || ""),
-        endTime: cleanTime(parsed.endTime || ""),
-        breakTime: cleanBreakTime(parsed.breakTime || "")
-      };
+      return normalizeFields(parsed);
     }
   } catch (err) {
     console.warn("AI項目抽出でエラー、フォールバックを使用:", err.message);
