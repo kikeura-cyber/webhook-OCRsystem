@@ -188,6 +188,58 @@ async function getAttachmentsFromFormrun(formId, entryId, entryNumber) {
     throw new Error("環境変数 FORMRUN_API_KEY が設定されていません。Render等の環境変数に設定してください。");
   }
 
+  formrunApiKey = formrunApiKey.trim().replace(/^Bearer\s+/i, "");const fetch = require("node-fetch");
+const express = require("express");
+const app = express();
+app.use(express.json());
+
+// Vision API 呼び出し
+async function callVisionAPI(base64Image) {
+  const apiKey = process.env.VISION_API_KEY;
+  if (!apiKey) {
+    throw new Error("環境変数 VISION_API_KEY が設定されていません。");
+  }
+
+  const requestBody = {
+    requests: [
+      {
+        image: { content: base64Image },
+        features: [{ type: "TEXT_DETECTION" }]
+      }
+    ]
+  };
+
+  const response = await fetch(
+    `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody)
+    }
+  );
+
+  const data = await response.json();
+
+  if (data.error) {
+    console.error("Vision API エラーレスポンス:", JSON.stringify(data.error, null, 2));
+    throw new Error(`Vision API Error: ${data.error.message}`);
+  }
+
+  if (!data.responses || !data.responses[0]) {
+    console.log("Vision API が画像を認識できませんでした:", JSON.stringify(data, null, 2));
+    return "(テキストなし)";
+  }
+
+  return data.responses[0].fullTextAnnotation?.text || "(テキストなし)";
+}
+
+// formrun API を呼び出してすべての添付ファイル情報（ダウンロード用URL付き）を取得
+async function getAttachmentsFromFormrun(formId, entryId, entryNumber) {
+  let formrunApiKey = process.env.FORMRUN_API_KEY;
+  if (!formrunApiKey) {
+    throw new Error("環境変数 FORMRUN_API_KEY が設定されていません。Render等の環境変数に設定してください。");
+  }
+
   formrunApiKey = formrunApiKey.trim().replace(/^Bearer\s+/i, "");
 
   console.log(
@@ -714,3 +766,4 @@ app.post("/formrun-webhook", async (req, res) => {
 });
 
 app.listen(3000, () => console.log("server started"));
+
