@@ -197,7 +197,92 @@ function fallbackExtractFields(text) {
   return result;
 }
 
-// AI (Gemini API) を用いてOCRテキストから項目を構造化抽出
+// AI (Gemini API) を用いて画像そのものから伝票の上部枠内（氏名・日付・開始時間・終了時間・休憩時間）を直接抽出
+async function extractFieldsDirectlyFromImage(base64Image, mimeType = "image/jpeg") {
+  const apiKey = process.env.GEMINI_API_KEY || process.env.VISION_API_KEY;
+  if (!apiKey) {
+    console.log("GEMINI_API_KEY / VISION_API_KEY が未設定のため、画像AI抽出をスキップします。");
+    return null;
+  }
+
+  try {
+    const prompt = `あなたはこの勤務伝票（<アットライン控>）の画像を正確に読み取るAIアシスタントです。
+
+【最重要ルール：読み取り範囲の限定】
+この伝票の「上半分（上部枠線内）」にある以下の項目のみを抽出し、JSONで返してください。
+下部にある「備考（区間や金額など）」「就業先」「交通費」「会社連絡先（電話番号）」「確認印」などは【絶対に抽出・混同せず、完全に無視】してください。
+
+【抽出項目】
+1. name: 「氏名」の右隣に手書きされている氏名（例: 坂本 英敏）
+2. date: 氏名の右側にある日付（例: 10月18日、10/18など）
+3. startTime: 表の「開始時間」列のマス目に手書きされた時間（例: 9:30 または 09:30）。背景にある薄い「88:88」ガイド枠は無視し、手書きされた数字のみを読み取ってください。
+4. endTime: 表の「終了時間」列のマス目に手書きされた時間（例: 17:15）。背景にある薄い「88:88」ガイド枠は無視し、手書きされた数字のみを読み取ってください。
+5. breakTime: 表の「休憩時間」列のマス目に手書きされた時間や分数（例: 60分、60、1:00 など）。背景のガイド枠は無視してください。
+
+【出力JSONフォーマット】
+Markdownコードブロック等は含めず、純粋なJSONのみを出力してください。
+{
+  "name": "抽出した氏名（不明な場合は空文字）",
+  "date": "抽出した日付（不明な場合は空文字）",
+  "startTime": "抽出した開始時間（不明な場合は空文字）",
+  "endTime": "抽出した終了時間（不明な場合は空文字）",
+  "breakTime": "抽出した休憩時間（不明な場合は空文字）"
+}`;
+
+    // Gemini 2.0 Flash / 1.5 Flash に画像とプロンプトを直接送信
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                { text: prompt },
+                {
+                  inlineData: {
+                    mimeType: mimeType || "image/jpeg",
+                    data: base64Image
+                  }
+                }
+              ]
+            }
+          ],
+          generationConfig: {
+            responseMimeType: "application/json"
+          }
+        })
+      }
+    );
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.log(`Gemini 画像直接認識API失敗 (ステータス: ${res.status}): ${errText}。テキストOCR解析にフォールバックします。`);
+      return null;
+    }
+
+    const data = await res.json();
+    const rawJson = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (rawJson) {
+      const parsed = JSON.parse(rawJson);
+      console.log("画像からの直接AI抽出に成功しました:", JSON.stringify(parsed));
+      return {
+        name: parsed.name || "",
+        date: parsed.date || "",
+        startTime: parsed.startTime || "",
+        endTime: parsed.endTime || "",
+        breakTime: parsed.breakTime || ""
+      };
+    }
+  } catch (err) {
+    console.warn("画像直接AI抽出処理中にエラー発生、フォールバックを使用:", err.message);
+  }
+
+  return null;
+}
+
+// AI (Gemini API) を用いてOCRテキストから項目を構造化抽出（フォールバック用）
 async function extractFieldsWithAI(ocrText) {
   const apiKey = process.env.GEMINI_API_KEY || process.env.VISION_API_KEY;
   if (!apiKey) {
@@ -205,7 +290,7 @@ async function extractFieldsWithAI(ocrText) {
   }
 
   try {
-    const prompt = `以下のOCRで読み取った勤務表・タイムカードのテキストから、【氏名】、【日付】、【開始時間】、【終了時間】、【休憩時間】を抽出してください。
+    const prompt = `以下のOCRで読み取った勤務伝票（<アットライン控>）のテキストから、【氏名】、【日付】、【開始時間】、【終了時間】、【休憩時間】を抽出してください。下部の備考・交通費・電話番号等は除外してください。
 必ず以下のJSONフォーマットのみを返してください。Markdownや余計な解説は一切含めないでください。
 
 {
@@ -319,8 +404,12 @@ app.post("/formrun-webhook", async (req, res) => {
       console.log(`[${i + 1}/${attachments.length}] Vision API OCR 実行中: ${file.filename}`);
       const rawText = await callVisionAPI(base64Image);
 
-      console.log(`[${i + 1}/${attachments.length}] 項目抽出実行中 (氏名・日付・時間)...`);
-      const extracted = await extractFieldsWithAI(rawText);
+      console.log(`[${i + 1}/${attachments.length}] 伝票フォーマット専用AI抽出中 (上部枠内)...`);
+      let extracted = await extractFieldsDirectlyFromImage(base64Image, file.contentType);
+      if (!extracted) {
+        console.log(`[${i + 1}/${attachments.length}] テキストOCRからの項目抽出へフォールバックします...`);
+        extracted = await extractFieldsWithAI(rawText);
+      }
       console.log(`抽出結果:`, JSON.stringify(extracted));
 
       ocrResults.push({
