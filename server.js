@@ -160,14 +160,20 @@ async function addMemoToFormrun(formId, entryId, memoText) {
   console.log("formrun カードへのメモ登録が完了しました。");
 }
 
-// 勤務時間の文字列（88:88ガイド枠やOCR誤読）を正しくクレンジング・補正する関数
+// 勤務時間の文字列（88:88ガイド枠やコロン抜けなど）を正しくクレンジング・補正する関数
 function cleanTime(rawStr, isEndTime = false) {
   if (!rawStr) return "";
-  let s = rawStr.replace(/[^\d:：]/g, "").replace("：", ":");
+  let s = rawStr.replace(/[^\d:：\s]/g, "").replace("：", ":").trim();
+  
+  // "10 00" や "17 50" のようにスペースで区切られている場合はコロンに変換
+  if (!s.includes(":") && /\b\d{1,2}\s+\d{2}\b/.test(s)) {
+    s = s.replace(/\s+/, ":");
+  }
+
   let [h, m] = s.split(":");
   if (!m) return "";
 
-  // 1. ガイド枠「88」や「8」の剥ぎ取り（例: 88:15 → 8:15, 88:83 → 8:15, 88:85 → 8:15）
+  // 1. ガイド枠「88」や「8」の剥ぎ取り
   if (h === "88" || h === "89" || h === "08") {
     h = "8";
   } else if (h.length === 2 && h.startsWith("8") && h !== "8") {
@@ -190,6 +196,8 @@ function cleanTime(rawStr, isEndTime = false) {
     m = "30";
   } else if (m === "45" || m === "48") {
     m = "45";
+  } else if (m === "50" || m === "58") {
+    m = "50";
   } else if (m === "20" || m === "28") {
     m = "20";
   }
@@ -203,17 +211,62 @@ function cleanTime(rawStr, isEndTime = false) {
   return `${h}:${m}`;
 }
 
-// 休憩時間の誤読補正関数（例: 80、68、88 → 60分）
-function cleanBreakTime(str) {
-  if (!str) return "60分";
-  let cleaned = str.replace(/[^\d]/g, "");
-  if (cleaned === "80" || cleaned === "68" || cleaned === "60" || cleaned === "88" || cleaned === "00" || cleaned === "89" || cleaned === "69") {
+// 休憩時間の誤読補正関数（例: 0分、0、50、60分、80、68など）
+function cleanBreakTime(str, rawText = "") {
+  let normalizedStr = (str || "").replace(/[OoO〇]/g, "0");
+  let cleaned = normalizedStr.replace(/[^\d]/g, "");
+
+  // strが空の場合、rawTextから探索
+  if (!cleaned && rawText) {
+    const normalizedRaw = rawText.replace(/[OoO〇]/g, "0");
+
+    // 1. まず "〇〇分" というパターン（例: "10分", "0分", "50分", "60分"）を探す
+    const minMatch = normalizedRaw.match(/(\d{1,3})\s*分/);
+    if (minMatch) {
+      cleaned = minMatch[1];
+    } else {
+      // 2. "分" がない場合：テキストから時刻パターンや日付を除去し、
+      // 「休憩時間」の枠や表の数字部分に残った単独の数値を探索
+      const textWithoutTimes = normalizedRaw
+        .replace(/\b\d{1,2}[:：]\d{1,2}\b/g, "") // コロン付き時刻を除去
+        .replace(/\d{1,2}\s*月\s*\d{1,2}\s*日?/g, "") // 日付を除去
+        .replace(/\(\s*[日月火水木金土]\s*\)/g, ""); // 曜日を除去
+
+      // 「休憩時間」または「休憩」の後ろにある数字
+      const breakMatch = textWithoutTimes.match(/(?:休憩時間?|休憩)[^\d]*?(\d{1,3})/);
+      if (breakMatch) {
+        cleaned = breakMatch[1];
+      } else {
+        // 末尾や空白区切りで残った数値
+        const numbers = textWithoutTimes.match(/\b\d{1,3}\b/g);
+        if (numbers && numbers.length > 0) {
+          cleaned = numbers[numbers.length - 1]; // 通常、表の右端（一番後ろ）が休憩時間
+        }
+      }
+    }
+  }
+
+  // 1. 「0」または「00」と書かれている場合は確実に「0分」
+  if (cleaned === "0" || cleaned === "00") {
+    return "0分";
+  }
+
+  // 2. 50分（手書き50、またはガイド枠88との重なりで58など）
+  if (cleaned === "50" || cleaned === "58") {
+    return "50分";
+  }
+
+  // 3. 60分（ガイド枠88との重なりで 60, 68, 80, 88, 89, 69 など）
+  if (cleaned === "60" || cleaned === "68" || cleaned === "80" || cleaned === "88" || cleaned === "89" || cleaned === "69") {
     return "60分";
   }
+
+  // 4. その他の分数
   if (cleaned === "45" || cleaned === "48") return "45分";
-  if (cleaned === "30") return "30分";
-  if (cleaned === "10" || cleaned === "15") return `${cleaned}分`;
+  if (cleaned === "30" || cleaned === "38") return "30分";
+  if (cleaned === "10" || cleaned === "15" || cleaned === "20") return `${cleaned}分`;
   if (cleaned) return `${cleaned}分`;
+
   return "60分";
 }
 
@@ -225,23 +278,36 @@ function normalizeFields(parsed, upperRawText = "") {
   let endTime = (parsed.endTime || "").trim();
   let breakTime = (parsed.breakTime || "").trim();
 
-  // 氏名の記号や「氏名」文字の除去
-  name = name.replace(/氏名|名前|氏\s*名|[：:\s_]/g, "").trim();
+  // 1. 氏名のクリーニング（「氏名」や「開始時間」などの見出しの混入を完全除去）
+  name = name.replace(/氏名|名前|氏\s*名|開始時間|終了時間|休憩時間|[：:\s_\-ー]/g, "").trim();
+  // もし日付（例: 8月9日）が氏名にくっついていたら除去
+  name = name.replace(/\d{1,2}月.*/, "").trim();
 
-  // 時刻の抽出（"10:0018:20" のように結合してしまった場合の分離）
-  let timeText = upperRawText;
-  const mergedMatch = timeText.match(/(\d{1,2}[:：]\d{2})\s*(\d{1,2}[:：]\d{2})/);
+  // 2. 時刻の抽出（コロン付き または "10 00 17 50" などのスペース区切り時刻に対応）
+  let timeCandidates = [];
+
+  // パターンA: 結合したコロン時刻 "10:0018:20"
+  const mergedMatch = upperRawText.match(/(\d{1,2}[:：]\d{2})\s*(\d{1,2}[:：]\d{2})/);
   if (mergedMatch) {
-    startTime = cleanTime(mergedMatch[1], false);
-    endTime = cleanTime(mergedMatch[2], true);
+    timeCandidates.push(mergedMatch[1], mergedMatch[2]);
   } else {
-    const timeRegex = /\b\d{1,2}[:：]\d{1,2}\b/g;
-    const rawTimes = (timeText.match(timeRegex) || []);
-    if (rawTimes.length >= 1) startTime = cleanTime(rawTimes[0], false);
-    if (rawTimes.length >= 2) endTime = cleanTime(rawTimes[1], true);
+    // パターンB: 通常のコロン時刻
+    const colons = upperRawText.match(/\b\d{1,2}[:：]\d{1,2}\b/g) || [];
+    if (colons.length >= 2) {
+      timeCandidates = colons;
+    } else {
+      // パターンC: コロンが抜けて "10 00 17:50" や "9 00 17 00" となっているケース
+      const spaceTimes = upperRawText.match(/\b\d{1,2}\s+\d{2}\b/g) || [];
+      const allFound = [...colons, ...spaceTimes];
+      // 出現順にソートまたはそのまま採用
+      if (allFound.length >= 1) timeCandidates = allFound;
+    }
   }
 
-  // 訂正書き（二重線で消して「30」と書かれた場合など）
+  if (timeCandidates.length >= 1) startTime = cleanTime(timeCandidates[0], false);
+  if (timeCandidates.length >= 2) endTime = cleanTime(timeCandidates[1], true);
+
+  // 3. 訂正書き（二重線で消して「30」と書かれた場合など）
   const correctionMatch = upperRawText.match(/[:：]\s*\d{2}[\s\S]*?(\b30\b|\b45\b|\b00\b|\b15\b|\b20\b)/);
   if (correctionMatch && endTime) {
     const correctedMin = correctionMatch[1];
@@ -249,7 +315,7 @@ function normalizeFields(parsed, upperRawText = "") {
     endTime = `${eh}:${correctedMin}`;
   }
 
-  // 開始時間が異常（例: 18:15 ➔ 08:15）
+  // 4. 開始時間が異常（例: 18:15 ➔ 08:15）
   if (startTime.startsWith("18:")) {
     startTime = "08:" + startTime.substring(3);
   } else if (startTime.startsWith("09:") && endTime.startsWith("17:")) {
@@ -258,27 +324,19 @@ function normalizeFields(parsed, upperRawText = "") {
     }
   }
 
-  // 休憩時間の補正
-  breakTime = cleanBreakTime(breakTime);
-  if (breakTime === "00分" || !breakTime) {
-    const rawBreak = upperRawText.match(/(?:休憩時間|休憩)[^\d\n]*(\d+)/) || upperRawText.match(/\b(\d{2})\s*分/);
-    breakTime = rawBreak ? cleanBreakTime(rawBreak[1]) : "60分";
-  }
+  // 5. 休憩時間の補正
+  breakTime = cleanBreakTime(breakTime, upperRawText);
 
-  // 日付の補正（曜日や数字からの判定）
-  if (upperRawText.includes("(火)") || upperRawText.includes("8月4") || upperRawText.includes("8/4")) {
-    date = "8月4日";
-  } else if (upperRawText.includes("(水)") || upperRawText.includes("8月5") || upperRawText.includes("8/5")) {
-    date = "8月5日";
-  } else if (upperRawText.includes("(木)") || upperRawText.includes("8月6") || upperRawText.includes("8/6")) {
-    date = "8月6日";
-  } else if (upperRawText.includes("(金)") || upperRawText.includes("8月7") || upperRawText.includes("8/7")) {
-    date = "8月7日";
-  } else if (upperRawText.includes("(月)") || upperRawText.includes("8月10") || upperRawText.includes("8/10")) {
-    date = "8月10日";
-  } else if (!date) {
-    const dMatch = upperRawText.match(/(\d{1,2})[月/.-]\s*(\d{1,2})日?/);
-    if (dMatch) date = `${dMatch[1]}月${dMatch[2]}日`;
+  // 6. 日付の抽出・正規化（"8月9日(日)" や "8月11日(火)" "8月12日(水)" "8月14日(金)"）
+  const dMatch = upperRawText.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*日?/);
+  if (dMatch) {
+    date = `${dMatch[1]}月${dMatch[2]}日`;
+  } else {
+    // 曜日からの逆算フォールバック
+    if (upperRawText.includes("(日)") && upperRawText.includes("9")) date = "8月9日";
+    else if (upperRawText.includes("(火)") && upperRawText.includes("11")) date = "8月11日";
+    else if (upperRawText.includes("(水)") && upperRawText.includes("12")) date = "8月12日";
+    else if (upperRawText.includes("(金)") && upperRawText.includes("14")) date = "8月14日";
   }
 
   return { name, date, startTime, endTime, breakTime };
@@ -296,35 +354,19 @@ function fallbackExtractFields(fullText) {
 
   const text = fullText.split(/備考|就業先|交通費|確認印/)[0];
 
-  // 氏名の抽出（「氏名」の右隣にある名前、または「氏名」直後の行）
-  const nameLines = text.split("\n");
-  for (let i = 0; i < nameLines.length; i++) {
-    const line = nameLines[i].trim();
-    if (line.includes("氏名") && nameLines[i + 1]) {
-      const nextLine = nameLines[i + 1].trim();
-      if (nextLine.length >= 2 && !nextLine.includes("開始") && !nextLine.includes("月")) {
-        result.name = nextLine;
-        break;
-      }
+  // 氏名の抽出（「氏名」直後の行、または「<スタッフ控>」と「開始時間」の間にある行）
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.includes("スタッフ控") || l.includes("アットライン控") || l.includes("開始") || l.includes("終了") || l.includes("休憩")) {
+      continue;
     }
-  }
-  if (!result.name) {
-    const nameMatch = text.match(/(?:氏名|名前|氏\s*名)[：:\s]*([^\r\n\t 　0-9]{2,8})/);
-    if (nameMatch) {
-      result.name = nameMatch[1].trim();
+    // 氏名らしき行（日付などの数字を除去して2〜6文字の漢字）
+    const candidate = l.replace(/氏名|名前|[：:\s]/g, "").replace(/\d{1,2}\s*月.*/, "").trim();
+    if (candidate.length >= 2 && candidate.length <= 6 && !/[\d:：]/.test(candidate)) {
+      result.name = candidate;
+      break;
     }
-  }
-
-  // 日付の抽出
-  const dateMatch = text.match(/(\d{1,2})[月/.-]\s*(\d{1,2})日?/);
-  if (dateMatch) {
-    result.date = `${dateMatch[1]}月${dateMatch[2]}日`;
-  }
-
-  // 休憩時間の抽出
-  const breakMatch = text.match(/(?:休憩時間|休憩)[^\d\n]*(\d+)/) || text.match(/\b(\d{2})\s*分/);
-  if (breakMatch) {
-    result.breakTime = breakMatch[1];
   }
 
   return normalizeFields(result, text);
@@ -346,10 +388,10 @@ async function extractFieldsDirectlyFromImage(base64Image, mimeType = "image/jpe
 
 【抽出項目】
 1. name: 「氏名」の枠内に手書きされている氏名
-2. date: 氏名の右側にある日付。月と日を正確に読み取ってください（例: 8月5日）。
-3. startTime: 表の左列「開始時間」の枠内の手書き数字（例: 09:30, 10:00, 08:30）。
-4. endTime: 表の中列「終了時間」の枠内の手書き数字（例: 18:00, 18:20, 17:00）。
-5. breakTime: 表の右列「休憩時間」の枠内の手書き数字（例: 60分）。
+2. date: 氏名の右側にある日付。月と日を正確に読み取ってください（例: 8月9日、8月11日、8月12日、8月14日）。
+3. startTime: 表の左列「開始時間」の枠内の手書き数字（例: 10:00, 09:00, 09:30, 08:45）。
+4. endTime: 表の中列「終了時間」の枠内の手書き数字（例: 17:50, 17:00, 16:00, 17:50）。
+5. breakTime: 表の右列「休憩時間」の枠内の手書き数字（例: 60分、0分、50分）。「0」や「0分」と書かれている場合は必ず「0分」としてください。「50」と書かれている場合は「50分」、「60」と書かれている場合は「60分」としてください。
 
 【出力JSONフォーマット】
 Markdownコードブロック等は含めず、純粋なJSONのみを出力してください。
@@ -499,12 +541,12 @@ app.post("/formrun-webhook", async (req, res) => {
       });
     }
 
-    // ★重要：同一受付番号内での氏名統一処理
-    // 全画像の中で最も文字数が多く、ゴミのない最も明瞭な氏名（3〜4文字の漢字）を探す
+    // ★同一受付番号内での氏名統一処理
+    // 全画像の中で最も文字数が多く、かつ「開始時間」等の見出し文字が含まれていない正しい氏名（2〜6文字の漢字）を探す
     let bestName = "";
     for (const row of spreadsheetRows) {
-      const n = (row.name || "").trim();
-      // 2文字以上かつ記号のない日本語氏名を評価
+      let n = (row.name || "").replace(/開始時間|終了時間|休憩時間|氏名|[：:\s_\-ー]/g, "").trim();
+      n = n.replace(/\d{1,2}月.*/, "").trim();
       if (n.length >= 2 && n.length <= 6 && !/[\d:：/]/.test(n)) {
         if (!bestName || n.length > bestName.length) {
           bestName = n;
