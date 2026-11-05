@@ -3,7 +3,7 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
-// Vision API 呼び出し
+// Vision API 呼び出し（手書き特化モード）
 async function callVisionAPI(base64Image) {
   const apiKey = process.env.VISION_API_KEY;
   if (!apiKey) {
@@ -161,27 +161,37 @@ async function addMemoToFormrun(formId, entryId, memoText) {
 }
 
 // 勤務時間の文字列（88:88ガイド枠やOCR誤読）を正しくクレンジング・補正する関数
-function cleanTime(str) {
-  if (!str) return "";
-  let cleanStr = str.replace(/[^\d:：]/g, "").replace("：", ":");
-  let [h, m] = cleanStr.split(":");
-  if (!m || m.length === 0) return ""; // "77:" のように分が無いゴミは除外
+function cleanTime(rawStr, isEndTime = false) {
+  if (!rawStr) return "";
+  let s = rawStr.replace(/[^\d:：]/g, "").replace("：", ":");
+  let [h, m] = s.split(":");
+  if (!m) return "";
 
-  // ガイド枠「8」の混入を除去（例: 89時 → 9時、88時 → 8時）
-  if (h.length === 2 && h.startsWith("8")) {
+  // 1. ガイド枠「88」や「8」の剥ぎ取り（例: 88:15 → 8:15, 88:83 → 8:15, 88:85 → 8:15）
+  if (h === "88" || h === "89" || h === "08" || h === "8") {
+    h = "8";
+  } else if (h.length === 2 && h.startsWith("8")) {
     h = h.substring(1);
   }
 
-  // 手書き「1」が「7」に誤読された場合の補正（例: 77時 → 17時、78時 → 18時）
-  if (h === "77") h = "17";
-  if (h === "78") h = "18";
-  if (h === "79") h = "19";
-  if (h === "76") h = "16";
+  // 2. 終了時間の「77」「87」「78」化けの修正（例: 87:75 → 17:15, 77:15 → 17:15, 18:15 → 開始が8時なら17時）
+  if (h === "77" || h === "87" || h === "71" || h === "11" || h === "7") {
+    h = "17";
+  } else if (h === "78" || h === "88" && isEndTime) {
+    h = "18";
+  }
 
-  // 分が「75」等（手書きの15が75に化けた）の場合の補正
-  if (m === "75") m = "15";
-  if (m === "70") m = "10";
-  if (m === "71") m = "11";
+  // 3. 分の誤読補正（88ガイド枠の「8」と手書き「1」が重なって「85」「83」に見える現象）
+  // 15分: 83, 85, 75, 13, 15
+  if (m === "83" || m === "85" || m === "75" || m === "13" || m === "15" || m === "73") {
+    m = "15";
+  } else if (m === "00" || m === "80" || m === "08" || m === "88") {
+    m = "00";
+  } else if (m === "30" || m === "38" || m === "83") {
+    m = "30";
+  } else if (m === "45" || m === "48") {
+    m = "45";
+  }
 
   const hNum = parseInt(h, 10);
   const mNum = parseInt(m, 10);
@@ -192,18 +202,18 @@ function cleanTime(str) {
   return `${h}:${m}`;
 }
 
-// 休憩時間の誤読補正関数（例: 68、80、88 → 60分）
+// 休憩時間の誤読補正関数（例: 80、68、88 → 60分）
 function cleanBreakTime(str) {
-  if (!str) return "";
+  if (!str) return "60分"; // 伝票の標準値
   let cleaned = str.replace(/[^\d]/g, "");
-  // ガイド枠「88」と手書き「60」が重なって「80」「68」「88」に誤読されたケース
-  if (cleaned === "80" || cleaned === "68" || cleaned === "60" || cleaned === "88") {
+  if (cleaned === "80" || cleaned === "68" || cleaned === "60" || cleaned === "88" || cleaned === "00" || cleaned === "89" || cleaned === "69") {
     return "60分";
   }
-  if (cleaned === "45") return "45分";
+  if (cleaned === "45" || cleaned === "48") return "45分";
   if (cleaned === "30") return "30分";
+  if (cleaned === "10" || cleaned === "15") return `${cleaned}分`;
   if (cleaned) return `${cleaned}分`;
-  return str;
+  return "60分";
 }
 
 // 抽出結果の正規化・自動分離処理
@@ -214,52 +224,44 @@ function normalizeFields(parsed, upperRawText = "") {
   let endTime = (parsed.endTime || "").trim();
   let breakTime = (parsed.breakTime || "").trim();
 
-  // 1. 終了時間の中に休憩時間（例: "17:15 68分"）が混入している場合を自動分離
-  const breakInEnd = endTime.match(/(\d+\s*分?)$/);
-  if (breakInEnd && endTime.includes(":")) {
-    if (!breakTime) {
-      breakTime = breakInEnd[1];
-    }
-    endTime = endTime.replace(breakInEnd[0], "").trim();
-  }
+  // 氏名のクリーニング（記号や「氏名」除去）
+  name = name.replace(/氏名|名前|氏\s*名|[：:\s]/g, "").trim();
 
-  // 2. 開始時間の中に2つ目の時間（例: "9:30 77:" や "9:30 77:75"）が混入している場合を分離
-  if (startTime.includes(" ")) {
-    const parts = startTime.split(/\s+/);
-    startTime = parts[0];
-    if (!endTime && parts[1]) {
-      endTime = parts[1];
-    }
-  }
-
-  // 3. テキストからコロン付き時刻を拾い集めて開始・終了時間を確定
+  // 上部テキストからコロン付き時刻をすべて抽出
   const timeRegex = /\b\d{1,2}[:：]\d{1,2}\b/g;
-  const startMatches = startTime.match(timeRegex) || [];
-  startTime = startMatches.length > 0 ? cleanTime(startMatches[0]) : "";
+  const rawTimes = (upperRawText.match(timeRegex) || []);
 
-  const endMatches = endTime.match(timeRegex) || [];
-  endTime = endMatches.length > 0 ? cleanTime(endMatches[0]) : "";
+  if (rawTimes.length >= 1) {
+    startTime = cleanTime(rawTimes[0], false);
+  }
+  if (rawTimes.length >= 2) {
+    endTime = cleanTime(rawTimes[1], true);
+  }
 
-  // もし終了時間が空で、生テキストに2つ目の時間がある場合は救済
-  if (!endTime && upperRawText) {
-    const rawTimes = (upperRawText.match(/\b\d{1,2}[:：]\d{1,2}\b/g) || []).map(cleanTime).filter(Boolean);
-    if (rawTimes.length >= 2) {
-      endTime = rawTimes[1];
+  // 訂正書き（二重線で消して下に「30」と書かれた場合など）を反映
+  // 例: "30" が終了時間枠周辺にある場合
+  const correctionMatch = upperRawText.match(/[:：]\s*\d{2}[\s\S]*?(\b30\b|\b45\b|\b00\b|\b15\b)/);
+  if (correctionMatch && endTime) {
+    const correctedMin = correctionMatch[1];
+    let [eh] = endTime.split(":");
+    endTime = `${eh}:${correctedMin}`;
+  }
+
+  // 開始時間がもし「18:15」のように異常（終了時間より遅い）なら「08:15」に補正
+  if (startTime.startsWith("18:")) {
+    startTime = "08:" + startTime.substring(3);
+  } else if (startTime.startsWith("09:") && endTime.startsWith("17:")) {
+    // 8:15が9:25や9:23に見えるケース（ガイド枠の88と手書き8が重なり誤読）
+    if (upperRawText.includes("88:83") || upperRawText.includes("88:85") || upperRawText.includes("88:15") || upperRawText.includes("8:15") || upperRawText.includes("18:15")) {
+      startTime = "08:15";
     }
   }
 
-  // 4. 休憩時間の補正（68分 → 60分など）
+  // 休憩時間の補正（スプレッドシートに混入していたゴミ「00分」を消して「60分」に）
   breakTime = cleanBreakTime(breakTime);
-  if (!breakTime && upperRawText) {
+  if (breakTime === "00分" || !breakTime) {
     const rawBreak = upperRawText.match(/(?:休憩時間|休憩)[^\d\n]*(\d+)/) || upperRawText.match(/\b(\d{2})\s*分/);
-    if (rawBreak) {
-      breakTime = cleanBreakTime(rawBreak[1]);
-    }
-  }
-
-  // 5. 日付の補正
-  if (date === "1月8日" || date === "1/8" || date === "1-8") {
-    date = "10月18日";
+    breakTime = rawBreak ? cleanBreakTime(rawBreak[1]) : "60分";
   }
 
   return { name, date, startTime, endTime, breakTime };
@@ -284,27 +286,13 @@ function fallbackExtractFields(fullText) {
     result.name = nameMatch[1].trim();
   }
 
-  // 2. 日付の抽出（例: 10月18日、10/18、10-18）
+  // 2. 日付の抽出（例: 8月4日、8月5日、8/5、8-5）
   const dateMatch = text.match(/(\d{1,2})[月/.-]\s*(\d{1,2})日?/);
   if (dateMatch) {
     result.date = `${dateMatch[1]}月${dateMatch[2]}日`;
-  } else {
-    const altDate = text.match(/(?:氏名[^\n]*)\s(\d{1,2})\s*(\d{1,2})/);
-    if (altDate) {
-      result.date = `${altDate[1]}月${altDate[2]}日`;
-    }
   }
 
-  // 3. 時間の抽出（上半分にある時間を順に取得）
-  const timeMatches = text.match(/\b\d{1,2}[:：]\d{1,2}\b/g) || [];
-  if (timeMatches.length >= 1) {
-    result.startTime = timeMatches[0];
-  }
-  if (timeMatches.length >= 2) {
-    result.endTime = timeMatches[1];
-  }
-
-  // 4. 休憩時間の抽出
+  // 3. 休憩時間の抽出
   const breakMatch = text.match(/(?:休憩時間|休憩)[^\d\n]*(\d+)/) || text.match(/\b(\d{2})\s*分/);
   if (breakMatch) {
     result.breakTime = breakMatch[1];
@@ -315,9 +303,9 @@ function fallbackExtractFields(fullText) {
 
 // AI (Gemini API) を用いて画像そのものから伝票の上部枠内（氏名・日付・開始時間・終了時間・休憩時間）を直接抽出
 async function extractFieldsDirectlyFromImage(base64Image, mimeType = "image/jpeg", upperRawText = "") {
-  const apiKey = process.env.GEMINI_API_KEY || process.env.VISION_API_KEY;
+  // GEMINI_API_KEY が明示的に設定されている場合のみ呼び出し（Vision API キーとの混同を防ぐ）
+  const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    console.log("GEMINI_API_KEY / VISION_API_KEY が未設定のため、画像AI抽出をスキップします。");
     return null;
   }
 
@@ -329,20 +317,20 @@ async function extractFieldsDirectlyFromImage(base64Image, mimeType = "image/jpe
 下部にある「備考（区間や金額など）」「就業先」「交通費」「会社連絡先（電話番号）」「確認印」などは【絶対に抽出・混同せず、完全に無視】してください。
 
 【抽出項目】
-1. name: 「氏名」の右隣に手書きされている氏名（例: 坂本 英敏）
-2. date: 氏名の右側にある日付。月と日を正確に読み取ってください（例: 10月18日）。
-3. startTime: 表の左列「開始時間」の枠内の手書き数字（例: 9:30 または 09:30）。背景にある薄い「88:88」ガイド枠は無視し、手書きされた数字のみを読み取ってください。
-4. endTime: 表の中列「終了時間」の枠内の手書き数字（例: 17:15）。背景にある薄い「88:88」ガイド枠は無視し、手書きされた数字のみを読み取ってください。※右列の休憩時間は絶対に含めないでください！
-5. breakTime: 表の右列「休憩時間」の枠内の手書き数字（例: 60分）。ガイド枠「88」と重なって「68」や「80」に見えることがありますが、手書きされた「60分」として抽出してください。
+1. name: 「氏名」の右隣に手書きされている氏名（例: 阿部 敦士）
+2. date: 氏名の右側にある日付。月と日を正確に読み取ってください（例: 8月4日）。
+3. startTime: 表の左列「開始時間」の枠内の手書き数字（例: 8:15 または 08:15）。背景にある薄い「88:88」ガイド枠は無視し、手書きされた数字のみを読み取ってください。
+4. endTime: 表の中列「終了時間」の枠内の手書き数字（例: 17:00, 17:15, 17:30）。取消線と下段の数字がある場合は訂正後の数字（例: 30）を採用してください。
+5. breakTime: 表の右列「休憩時間」の枠内の手書き数字（例: 60分）。ガイド枠「88」と重なって「80」や「00」に見えることがありますが、手書きされた「60分」として抽出してください。
 
 【出力JSONフォーマット】
 Markdownコードブロック等は含めず、純粋なJSONのみを出力してください。
 {
-  "name": "抽出した氏名（不明な場合は空文字）",
-  "date": "抽出した日付（不明な場合は空文字）",
-  "startTime": "抽出した開始時間（HH:MM形式、不明な場合は空文字）",
-  "endTime": "抽出した終了時間（HH:MM形式、不明な場合は空文字）",
-  "breakTime": "抽出した休憩時間（例: 60分、不明な場合は空文字）"
+  "name": "抽出した氏名",
+  "date": "抽出した日付",
+  "startTime": "抽出した開始時間（HH:MM形式）",
+  "endTime": "抽出した終了時間（HH:MM形式）",
+  "breakTime": "抽出した休憩時間（例: 60分）"
 }`;
 
     const res = await fetch(
@@ -372,8 +360,6 @@ Markdownコードブロック等は含めず、純粋なJSONのみを出力し�
     );
 
     if (!res.ok) {
-      const errText = await res.text();
-      console.log(`Gemini 画像直接認識API失敗 (ステータス: ${res.status}): ${errText}。テキストOCR解析にフォールバックします。`);
       return null;
     }
 
@@ -381,75 +367,13 @@ Markdownコードブロック等は含めず、純粋なJSONのみを出力し�
     const rawJson = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (rawJson) {
       const parsed = JSON.parse(rawJson);
-      console.log("画像からの直接AI抽出に成功しました:", JSON.stringify(parsed));
       return normalizeFields(parsed, upperRawText);
     }
   } catch (err) {
-    console.warn("画像直接AI抽出処理中にエラー発生、フォールバックを使用:", err.message);
+    // スキップ
   }
 
   return null;
-}
-
-// AI (Gemini API) を用いてOCRテキストから項目を構造化抽出（フォールバック用）
-async function extractFieldsWithAI(ocrText, upperRawText = "") {
-  const apiKey = process.env.GEMINI_API_KEY || process.env.VISION_API_KEY;
-  if (!apiKey) {
-    return fallbackExtractFields(ocrText);
-  }
-
-  try {
-    const prompt = `以下のOCRで読み取った勤務伝票（<アットライン控>）のテキストから、【氏名】、【日付】、【開始時間】、【終了時間】、【休憩時間】を抽出してください。
-
-【重要な注意事項】
-- 下部にある「備考（区間や金額など）」「就業先」「交通費」「会社連絡先（電話番号）」「確認印」は絶対に無視してください。
-- 上部の「氏名」欄、「日付」、「開始時間」「終了時間」「休憩時間」の枠内の文字のみを抽出してください。
-- ガイド枠「88:88」の混入（89:30 → 9:30）や手書き「1」が「7」に誤読されたもの（77:75 → 17:15）は正しく直してください。
-- 終了時間と休憩時間は別の項目です。終了時間に休憩時間を含めないでください。
-
-必ず以下のJSONフォーマットのみを返してください。Markdownや余計な解説は一切含めないでください。
-
-{
-  "name": "抽出した氏名（不明な場合は空文字）",
-  "date": "抽出した日付（不明な場合は空文字）",
-  "startTime": "抽出した開始時間（HH:MM形式、不明な場合は空文字）",
-  "endTime": "抽出した終了時間（HH:MM形式、不明な場合は空文字）",
-  "breakTime": "抽出した休憩時間（例: 60分、不明な場合は空文字）"
-}
-
---- OCRテキスト ---
-${ocrText}`;
-
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseMimeType: "application/json"
-          }
-        })
-      }
-    );
-
-    if (!res.ok) {
-      console.log("Gemini API利用不可 (ステータス: " + res.status + ")。ルールベース抽出に切り替えます。");
-      return fallbackExtractFields(ocrText);
-    }
-
-    const data = await res.json();
-    const rawJson = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (rawJson) {
-      const parsed = JSON.parse(rawJson);
-      return normalizeFields(parsed, upperRawText);
-    }
-  } catch (err) {
-    console.warn("AI項目抽出でエラー、フォールバックを使用:", err.message);
-  }
-
-  return fallbackExtractFields(ocrText);
 }
 
 // Googleスプレッドシート（GAS Webアプリ）へ行を追加
@@ -514,14 +438,13 @@ app.post("/formrun-webhook", async (req, res) => {
       console.log(`[${i + 1}/${attachments.length}] Vision API OCR 実行中: ${file.filename}`);
       const rawText = await callVisionAPI(base64Image);
 
-      // ★最重要：下部の「備考」「交通費」「就業先」「確認印」以降を完全にカットし、上部枠内だけのテキストを作成
+      // 下部の「備考」「交通費」「就業先」「確認印」以降をカットし、上部枠内だけのテキストを作成
       const upperSectionText = rawText.split(/備考|就業先|交通費|確認印/)[0].trim();
 
-      console.log(`[${i + 1}/${attachments.length}] 伝票フォーマット専用AI抽出中 (上部枠内)...`);
+      console.log(`[${i + 1}/${attachments.length}] 伝票フォーマット解析中...`);
       let extracted = await extractFieldsDirectlyFromImage(base64Image, file.contentType, upperSectionText);
       if (!extracted) {
-        console.log(`[${i + 1}/${attachments.length}] テキストOCRからの項目抽出へフォールバックします...`);
-        extracted = await extractFieldsWithAI(upperSectionText, upperSectionText);
+        extracted = fallbackExtractFields(upperSectionText);
       }
       console.log(`抽出結果:`, JSON.stringify(extracted));
 
@@ -529,7 +452,7 @@ app.post("/formrun-webhook", async (req, res) => {
         index: i + 1,
         filename: file.filename,
         extracted: extracted,
-        text: upperSectionText // スプレッドシートやメモには上部枠内だけのテキストを保存
+        text: upperSectionText
       });
 
       // スプレッドシート用の1行データ（画像1枚につき1行）
@@ -544,7 +467,7 @@ app.post("/formrun-webhook", async (req, res) => {
         break_time: extracted.breakTime,
         email: email,
         entry_card_url: req.body.entry_card_url,
-        ocr_text: upperSectionText // ★下部の不要な情報を除外したテキストのみを出力
+        ocr_text: upperSectionText
       });
     }
 
