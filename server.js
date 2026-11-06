@@ -3,6 +3,26 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
+// ===== 重複処理防止（Idempotency） =====
+// 処理済みの entry_id を最大 500 件まで保持する Set
+// サーバー再起動でリセットされるが、formrun のリトライは通常数分以内なので十分
+const processedEntryIds = new Set();
+const MAX_PROCESSED_IDS = 500;
+
+function markAsProcessed(entryId) {
+  processedEntryIds.add(String(entryId));
+  // 上限を超えたら最古のエントリを削除（FIFO的に管理）
+  if (processedEntryIds.size > MAX_PROCESSED_IDS) {
+    const first = processedEntryIds.values().next().value;
+    processedEntryIds.delete(first);
+  }
+}
+
+function isAlreadyProcessed(entryId) {
+  return processedEntryIds.has(String(entryId));
+}
+// =========================================
+
 // Vision API 呼び出し（手書き特化モード）
 async function callVisionAPI(base64Image) {
   const apiKey = process.env.VISION_API_KEY;
@@ -536,6 +556,20 @@ app.post("/formrun-webhook", async (req, res) => {
   console.log(JSON.stringify(req.body, null, 2));
 
   const { form_id, entry_id, entry_number } = req.body;
+
+  // ===== 重複処理チェック =====
+  if (!entry_id) {
+    console.warn("entry_id が未設定のリクエストを無視しました。");
+    return res.status(200).send("OK (entry_id missing)");
+  }
+  if (isAlreadyProcessed(entry_id)) {
+    console.log(`【重複スキップ】entry_id="${entry_id}" はすでに処理済みです。再送リトライを無視します。`);
+    return res.status(200).send("OK (duplicate)");
+  }
+  // 処理開始と同時にマーク（二重実行防止）
+  markAsProcessed(entry_id);
+  console.log(`【新規処理開始】entry_id="${entry_id}" (受付番号: ${entry_number})`);
+  // ===========================
 
   try {
     // 1. formrun API からすべての添付ファイル情報を取得
